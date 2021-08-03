@@ -1,0 +1,186 @@
+# Python service Makefile
+
+project := $(shell yq -r .name .project.yml)
+namespace := $(shell yq -r .namespace .project.yml)
+context := $(shell kubectl config current-context)
+version := $(shell date +%s)
+image_repo := $(shell yq -r .image_repo .project.yml)
+
+ifeq ($(namespace),null)
+namespace := $(project)
+endif
+
+.PHONY: all help lint deps devdeps test build deploy run stop jwt venv clean secrets
+
+# target: all - Run the full pipeline.
+all: lint test build
+
+# target: help - Display callable targets.
+help:
+	@sed -n 's/^# target: \(.*\)/make \1/p' [Mm]akefile
+
+# target: lint - Run linting tools.
+lint:
+	@flake8 --exclude lib
+	@spectral lint api/spec.yml
+
+# target: deps - Install dependencies.
+deps: .make/deps
+
+.make/deps:
+	@pip3 install \
+	-i "https://$$PIP_USERNAME:$$PIP_PASSWORD@artifacts.awk.space/repository/python/simple" \
+	-U \
+	--extra-index-url https://pypi.python.org/simple \
+	--target lib \
+	-r requirements.txt
+	@mkdir -p .make && touch .make/deps
+
+# target: devdeps - Install test dependencies.
+devdeps: .make/devdeps deps
+
+.make/devdeps:
+	@pip3 install \
+	-i "https://$$PIP_USERNAME:$$PIP_PASSWORD@artifacts.awk.space/repository/python/simple" \
+	-U \
+	--extra-index-url https://pypi.python.org/simple \
+	--target lib \
+	-r dev_requirements.txt
+	@mkdir -p .make && touch .make/devdeps
+
+# target: test - Run pytest.
+test: devdeps
+	@python3 -m pytest
+
+# target: build - Build Docker container.
+build: .make/build
+
+.make/build:
+	@echo "[global]" > pip.secret
+	@echo "index-url = https://$$PIP_USERNAME:$$PIP_PASSWORD@artifacts.awk.space/repository/python/simple" >> pip.secret
+	@echo "extra-index-url = https://pypi.python.org/simple" >> pip.secret
+	@DOCKER_BUILDKIT=1 \
+	docker build \
+		--secret id=pip,src=pip.secret \
+		--build-arg VERSION=$(version) \
+		-t "awkspace/$(project):$(version)" .
+	@mkdir -p .make && \
+		echo "IMAGE_TAG=$(version)" > .make/build && \
+		echo "LOCAL_IMAGE=awkspace/$(project):$(version)" >> .make/build
+
+# target: push - Push to ECR.
+push: .make/push
+
+.make/push: build
+	@if [ "$(image_repo)" = "ecr" ] ; then \
+		eval $$(aws ecr get-login --no-include-email) && \
+		. .make/build && \
+		if ! aws ecr describe-repositories --repository-name "$(project)" >/dev/null 2>&1 ; then \
+	        curl -Lo .make/policy.json https://awk.st/CwtCb && \
+			aws ecr create-repository --repository-name "$(project)" && \
+			aws ecr put-lifecycle-policy --repository-name "$(project)" --lifecycle-policy-text 'file://.make/policy.json' ; \
+		fi && \
+		docker tag "$$LOCAL_IMAGE" "$$ECR/$(project):$$IMAGE_TAG" && \
+		docker push "$$ECR/$(project):$$IMAGE_TAG" && \
+		mkdir -p .make && echo "REMOTE_IMAGE=$$ECR/$(project):$$IMAGE_TAG" > .make/push ; \
+	elif [ "$(image_repo)" = "nexus" ] ; then \
+		docker login docker.awk.space && \
+		. .make/build && \
+		docker tag "$$LOCAL_IMAGE" "docker.awk.space/$(project):$$IMAGE_TAG" && \
+		docker push "docker.awk.space/$(project):$$IMAGE_TAG" && \
+		mkdir -p .make && echo "REMOTE_IMAGE=docker.awk.space/$(project):$$IMAGE_TAG" > .make/push ; \
+	fi
+
+# target: secrets - Generate secrets for this project.
+secrets:
+	@k8s-secretgen --namespace=$(namespace)
+
+# target: deploy - Deploy to the currently selected kubectl context. NONINTERACTIVE=1 skips prompt.
+deploy: build
+	@if [ "$(context)" != "minikube" ] && [ ! -f .make/push ] ; then \
+		make push ; \
+	fi
+	@if [ -z "$${NONINTERACTIVE}" ] ; then \
+		printf "Targeting $(context). Press ENTER to continue or ^C to cancel. " && read _ ; \
+	fi
+	@echo "Deploying to $(context)..."
+	@if [ "$(context)" = "minikube" ] ; then \
+		. .make/build && \
+		tmpfile=$$(tempfile) && \
+		docker save "$$LOCAL_IMAGE" > $$tmpfile && \
+		eval $$(minikube docker-env) && \
+		docker load < $$tmpfile ; \
+		rm -f $$tmpfile ; \
+	fi
+	@if ! kubectl get "namespace/$(namespace)" >/dev/null 2>&1 ; then \
+		kubectl create namespace "$(namespace)" ; \
+		if kubectl get cronjob/manage-ecr-secret >/dev/null 2>&1 ; then \
+		 	kubectl create job --from=cronjob/manage-ecr-secret manage-ecr-secret-`date +%s` ; \
+		fi \
+	fi
+	@k8s-secretgen --namespace="$(namespace)"
+	@. .make/build && if [ "$(context)" != "minikube" ] ; then . .make/push ; fi && \
+	helm upgrade "$(project)" . \
+		--namespace "$(namespace)" \
+		--values ".project.yml" \
+		--set local=$$([ "$(context)" = "minikube" ] && echo true || echo false) \
+		--set image=$$([ "$(context)" = "minikube" ] && echo "$$LOCAL_IMAGE" || echo "$$REMOTE_IMAGE") \
+		--create-namespace \
+		--install \
+		--atomic \
+		--wait \
+		--cleanup-on-fail
+
+# target: undeploy - Undeploy from the currently selected kubectl context.
+undeploy:
+	@printf "Targeting $(context). "
+	@printf "To continue, type the name of the context/project that will be undeployed, ex. minikube/todo. "
+	@read input && [ "$(context)/$(project)" = "$$input" ]
+	@if helm status "$(project)" >/dev/null 2>&1 ; then \
+		helm uninstall "$(project)" --namespace "$(namespace)" ; \
+	fi
+	@if [ "$(project)" = "$(namespace)" ] && kubectl get "namespace/$(namespace)" >/dev/null 2>&1 ; then \
+		kubectl delete namespace "$(namespace)" ; \
+	fi
+
+# target: redeploy - Undeploy then deploy
+redeploy: | undeploy deploy
+
+# target: backup - Back up service database
+backup:
+	@[ ! -z "${BACKUP_DIR}" ]
+	@mkdir -p "$$BACKUP_DIR/$(context)/$(project)"
+	@kubectl exec -n "$(namespace)" db-0 -- pg_dump -U postgres --clean > "$$BACKUP_DIR/$(context)/$(project)/pg_dump"
+
+# target: restore - Restore from backup
+restore:
+	@[ ! -z "${BACKUP_DIR}" ]
+	@kubectl exec -n "$(namespace)" -i db-0 -- psql -U postgres < "$$BACKUP_DIR/$(context)/$(project)/pg_dump"
+
+# target: run - Stand up project locally.
+run: devdeps
+	@docker-compose up -d db
+	@. ./.flaskenv && python3 -m todo.app
+
+# target: stop - Stop locally running project.
+stop:
+	@docker-compose down -v
+
+# target: jwt - Retrieve an admin token for the current project.
+jwt:
+	@jwtvend $(project)
+
+# target: clean
+clean:
+	@rm -rf lib/*
+	@if [ -f .make/build ] ; then \
+		. .make/build ; \
+		if docker image inspect "$$LOCAL_IMAGE" >/dev/null 2>&1 ; then \
+			docker rmi "$$LOCAL_IMAGE" ; \
+		fi \
+	fi
+	@rm -rf .make/*
+
+# target: update
+update:
+	@curl https://raw.githubusercontent.com/awkspace/Makefiles/master/Makefile.python > Makefile
